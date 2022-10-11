@@ -1,0 +1,193 @@
+# Unique name for this workflow
+name: Validate PR on integration branch
+
+# Definition when the workflow should run
+on:
+    pull_request:
+      # This workflow will run when a pull request is opened, or when a commit is pushed
+      # to a branch that has an existing pull request
+      types: [opened, synchronize]
+      branches: [ integration ]
+      # We only care about changes to the force-app directory. This prevents the job from running
+      # when changing non-salesforce files (like this yml file).
+      paths:
+        - 'force-app/**'
+            
+
+# Jobs to be executed
+jobs:
+    validate-deployment-on-integration-org:
+        runs-on: ubuntu-latest
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        steps:
+            # Install nodejs
+            - uses: actions/setup-node@v2
+              with:
+                node-version: '14'
+
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v2
+              with:
+                fetch-depth: 0
+
+            # Read the body of the pull request and extract the names of the
+            # tests classes that should be run when deploying the changes on this commit
+            
+            # The tests should be specified in the PR body using the following syntax
+            # Apex::[CommunitiesLoginControllerTest,MyProfilePageControllerTest,AnotherTestClass]::Apex
+            # This special delimeter can be added to the PR template so that your team doesn't have to remember the syntax
+            - name: 'Read PR Body'
+              env:
+                # The pull request body is available through the github context object
+                # we put the body of the pull request in an env variable (only available to this step)
+                PAYLOAD: ${{github.event.pull_request.body}}
+
+              # Here we print the content of the environment variable and
+              # pipe to a a text file.
+              # Then we call the local script parsePR.js, which will create
+              # a new file called testsToRun.txt. This file will have the list
+              # of tests to run separated by a comma
+
+              # Finally, we add the list of tests to the $GITHUB_ENV variable
+              # as this allows us to reference the list in a subsequent step.  If you
+              # were using a normal env variable, its value would not be available outside this step.
+              run: |
+                  echo $PAYLOAD > ./pr_body.txt
+                  node ./parsePR.js              
+                  TESTS=$(cat testsToRun.txt)       
+                  echo "APEX_TESTS=$TESTS" >> $GITHUB_ENV
+                  
+              # Slack Notification Start Message to slack-github-action-test
+            - name: Slack Notification on start
+              uses: rtCamp/action-slack-notify@v2
+              env:
+                  SLACK_CHANNEL: slack-github-action-test
+                  SLACK_COLOR: ${{ job.status }}
+                  SLACK_MESSAGE: ${{ job.status }} "Notifitcation"
+                  SLACK_TITLE: “Deploy is starting”
+                  SLACK_USERNAME: DongHyun
+                  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+            # Install Salesforce CLI
+            - name: 'Install Salesforce CLI'
+              run: |
+                  wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+                  mkdir ~/sfdx
+                  tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
+                  echo "$HOME/sfdx/bin" >> $GITHUB_PATH
+                  ~/sfdx/bin/sfdx version
+
+            # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
+            - name: 'Installing sfdx git delta'
+              run: | 
+                  echo y | sfdx plugins:install sfdx-git-delta
+                  sfdx plugins 
+
+            # Install java
+            - name: 'Installing java'
+              run: sudo apt-get install openjdk-8-jdk
+
+            # Install SFDX scanner
+            - name: 'Installing SFDX scanner'
+              run: sfdx plugins:install @salesforce/sfdx-scanner
+
+            # Get the Integration Org SFDX URL and store it in a text file
+            - name: 'Populate auth file with SFDX_URL secret of integration org'
+              shell: bash
+              run: |
+                  echo ${{ secrets.SFDX_SIT2_URL}} > ./SFDX_SIT2_URL.txt
+                  cat ./SFDX_SIT2_URL.txt
+
+            # Authenticate to org using the URL stored in the text file
+            - name: 'Authenticate to SIT2 Org'
+              run: sfdx auth:sfdxurl:store -f ./SFDX_SIT2_URL.txt -s -a SIT2
+
+            # We use SFDX Git Delta to create a directory with only the metadata that has changed, this allows us
+            # to deploy only those changes, as opposed to deploying the entire branch. This helps reducing deployment times
+            - name: 'Create delta packages for new, modified or deleted metadata'
+              run: | 
+                  mkdir changed-sources
+                  sfdx sgd:source:delta --to "HEAD" --from "HEAD^" --output changed-sources/ --generate-delta --source force-app/ 
+
+            # Scan the code in the delta directory by using sfdx scanner. Output the results of the scan in a new file
+            # called apexScanResults.sarif
+            - name: 'Scan code'
+              run: |
+                  cd changed-sources
+                  sfdx scanner:run --format sarif --target './**/*.cls' --category "Design,Best Practices,Performance" --outfile 'apexScanResults.sarif'  
+                  cd ..
+
+            - name: Upload SARIF file
+              uses: github/codeql-action/upload-sarif@v1
+              with:
+                sarif_file: changed-sources/apexScanResults.sarif
+
+            # We do a check-only depploy and we only run the tests specified in the PR
+            # If the env variable does not equal 'all', we know that there is a list of
+            # tests that can be run
+            - name: 'Check-only deploy delta changes - run specified tests'
+              if: ${{ env.APEX_TESTS != 'all' }}
+              run: |
+                  echo ${{env.APEX_TESTS}}
+                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunSpecifiedTests --runtests ${{env.APEX_TESTS}} --json
+
+            # We do a check-only deploy and we run all tests
+            - name: 'Check-only deploy delta changes - run all tests'
+              if: ${{ env.APEX_TESTS == 'all' }}
+              run: |
+                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunLocalTests  --json
+
+            - name: 'Deploy destructive changes (if any)'
+              run: sfdx force:mdapi:deploy -d "changed-sources/destructiveChanges" --checkonly --ignorewarnings 
+
+               # Slack Notification End Message to slack-github-action-test
+            # - name: Slack Notification on ended
+            #   uses: rtCamp/action-slack-notify@v2
+            #   env:
+            #       SLACK_CHANNEL: slack-github-action-test
+            #       SLACK_COLOR: ${{ job.status }}
+            #       SLACK_MESSAGE: ${{ job.status }} "Notification"
+            #       SLACK_TITLE: “Deploy is Ended”
+            #       SLACK_USERNAME: DongHyun
+            #       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+            - name: Notify slack pr open
+              env: 
+                SLACK_WEBHOOK_URL : ${{ secrets.SLACK_WEBHOOK }}
+                PULL_REQUEST_NUMBER : ${{ github.event.pull_request.number }}
+                PULL_REQUEST_TITLE : ${{ github.event.pull_request.title }}
+                PULL_REQUEST_AUTHOR_NAME : ${{ github.event.pull_request.user.login }}
+                PULL_REQUEST_AUTHOR_ICON_URL : ${{ github.event.pull_request.user.avatar_url }}
+                PULL_REQUEST_URL : ${{ github.event.pull_request.html_url }}
+                PULL_REQUEST_BODY : ${{ github.event.pull_request.body }}
+                PULL_REQUEST_COMPARE_BRANCH_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+                PULL_REQUEST_COMPARE_BRANCH_NAME : ${{ github.event.pull_request.head.ref }}
+                PULL_REQUEST_BASE_BRANCH_OWNER: ${{ github.event.pull_request.base.repo.owner.login }}
+                PULL_REQUEST_BASE_BRANCH_NAME : ${{ github.event.pull_request.base.ref }}
+                IS_SEND_HERE_MENTION : false
+                MAKE_PRETTY : true
+                MAKE_COMPACT : false
+                IS_PR_FROM_FORK: false
+                SEND_USER_ID_MENTIONS :
+                SEND_GROUP_ID_MENTIONS : 
+              uses: jun3453/slack-pr-open-notification-action@v1.3.0
+
+              ## python installation
+            - name: Set up Python 3.10
+              uses: actions/setup-python@v3
+              with:
+                python-version: "3.10"
+            - name: Install dependencies
+              run: |
+                python -m pip install --upgrade pip
+                pip install flake8 pytest
+                if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            - name: Lint with flake8
+              run: |
+                # stop the build if there are Python syntax errors or undefined names
+                flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+                # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+                flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+            - name: run json-python-run.py
+              run : |
+                python3 -m pip install requests
+                python3 json-python-run.py
