@@ -3,5 +3,6 @@ public with sharing class DeployApex {
     public static void test(){
         System.assertEquals(1, 1, 'true');
         System.assertEquals(2, 2, 'true');
+        System.assertEquals(3, 3, 'true');
     }
 }
